@@ -1,0 +1,136 @@
+name: CI
+
+# Every gate here runs on a BARE python3 with no third-party imports. That is a
+# property of the appliance this ships on -- it has no pip and no way to get one
+# -- so it is worth demonstrating rather than quietly depending on.
+#
+# Nothing in this workflow executes a sample. The engine runs at policy=static
+# in its selftest, and the node/relay round trips bind loopback on an ephemeral
+# port. The live chambers need unshare + strace or a prepared guest image, and
+# are exercised by hand (see docs/crucible.md), deliberately not in CI: a
+# hosted runner is the wrong place to detonate malware.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  publication-policy:
+    name: publication policy (no keys, no samples, no lab identity)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      # Prove the checker still detects what it claims before trusting a PASS.
+      # A scanner whose rules have silently stopped matching reports success.
+      - name: scanner selftest
+        run: python3 tools/publish-check.py --selftest
+
+      # This repository's code spools live malware to disk while it runs, so
+      # this gate is not only about keys: it is what stops a node operator's
+      # working directory reaching a commit.
+      - name: scan the tree against tools/PUBLISH-POLICY
+        run: python3 tools/publish-check.py
+
+  selftests:
+    name: crypto, engine and node selftests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      # Deliberately NOT installing anything. If a selftest starts needing a
+      # dependency, this job should fail rather than acquire it -- the
+      # appliance cannot.
+      - name: no third-party modules are available
+        run: |
+          set -eu
+          python3 - <<'EOF'
+          import importlib
+          for mod in ("numpy", "cryptography", "requests", "fastapi", "pytest"):
+              try:
+                  importlib.import_module(mod)
+              except ImportError:
+                  continue
+              raise SystemExit("%s is importable; this job must run bare" % mod)
+          print("bare python3 confirmed")
+          EOF
+
+      # ed25519 is a dependency-free reference implementation because the
+      # target appliances have no `cryptography` module. Its selftest covers
+      # the RFC 8032 s7.1 vectors plus negative cases, and it is the mechanism
+      # by which drift from FFN-NGFW's identical copy would be detected.
+      - name: ffn_ed25519 selftest (RFC 8032 vectors)
+        run: python3 ffn_ed25519.py --selftest
+
+      # Format dissectors against synthetic PE/ELF built in-process, the
+      # DNS/HTTP/TLS sinkhole over loopback, the strace and pcap parsers, the
+      # behaviour assay, and the IOC-safety guards that keep the analysis
+      # network and PKI infrastructure out of a blocklist.
+      - name: ffn_crucible selftest (dissectors, sinkhole, assay, IOC safety)
+        run: python3 ffn_crucible.py selftest
+
+      # A full submit -> detonate -> signed-verdict round trip over loopback
+      # HTTP with real generated keys, plus the forgery cases: a flipped
+      # verdict, an injected IOC, an injected signature, a wrong key, and an
+      # algorithm downgrade must every one be refused.
+      - name: ffn_crucible_node selftest (signed verdicts, forgery refusal)
+        run: python3 ffn_crucible_node.py selftest
+
+      - name: every python file compiles
+        run: |
+          set -eu
+          find . -name '*.py' -not -path './.git/*' -print0 \
+            | xargs -0 -n50 python3 -m py_compile
+          echo "compiled cleanly"
+
+      # The engine must behave identically with and without FFN-NGFW's modules
+      # beside it -- it soft-imports them and falls back. A regression here
+      # means a standalone node silently loses a capability, which is how
+      # signature generation was once lost without any test noticing.
+      - name: the engine stands alone
+        run: |
+          set -eu
+          mkdir -p /tmp/alone
+          cp ffn_crucible.py ffn_crucible_node.py ffn_ed25519.py /tmp/alone/
+          cd /tmp/alone
+          python3 -c "import ffn_crucible, ffn_crucible_node; print('imports clean')"
+          python3 ffn_crucible.py selftest
+          python3 ffn_crucible_node.py selftest
+
+  chambers:
+    name: live chamber availability (informational)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      # Informational, and allowed to fail. It records what a hosted runner can
+      # actually do, which is how we learn whether the jail chamber's
+      # unprivileged-userns assumption still holds on a current kernel. It does
+      # NOT detonate anything.
+      - name: what chambers would be available here
+        run: |
+          python3 ffn_crucible.py chambers
+          echo "--- tooling present ---"
+          command -v unshare strace qemu-system-x86_64 || true
+          cat /proc/sys/kernel/unprivileged_userns_clone 2>/dev/null || \
+            echo "sysctl absent (userns likely permitted)"

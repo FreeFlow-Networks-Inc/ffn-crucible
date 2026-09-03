@@ -1,0 +1,74 @@
+# Crucible handles malware samples and generates key material. Most of what
+# this file exists to keep out of git is not build noise -- it is live malware,
+# private keys, and captured traffic.
+
+# --- key material ---------------------------------------------------------
+# The verdict-signing seed. Its whole security property is that it never
+# leaves the node it was generated on.
+*.key
+*.pem
+*.p12
+*.pfx
+id_rsa
+id_ed25519
+*.token
+crucible-verdict.*
+!crucible-verdict.pub
+# Public keys are not secret and a client needs one to verify anything.
+!*.pub
+
+# --- spooled samples ------------------------------------------------------
+# The node spools every submitted object to disk. These ARE malware. A stray
+# `git add -A` in a node's working directory must not be able to commit them,
+# and this is the line that stops it.
+samples/
+spool/
+/var/
+crucible/
+*.sample
+*.malware
+
+# --- databases and state --------------------------------------------------
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.db
+node.sqlite*
+threatdb.sqlite*
+
+# --- guest images and captures --------------------------------------------
+# A qcow2 guest is gigabytes and is built, not authored. Captures contain
+# whatever the sample did, which may include exfiltrated data.
+*.qcow2
+*.qcow2.*
+*.img
+*.img.gz
+*.vmdk
+*.iso
+*.pcap
+*.pcapng
+guests/
+overlay*.qcow2
+
+# --- analysis output ------------------------------------------------------
+trace.log
+events.json
+*.dmp
+reports/
+
+# --- python ---------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+
+# --- editors and OS -------------------------------------------------------
+*.swp
+*~
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

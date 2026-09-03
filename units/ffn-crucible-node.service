@@ -1,0 +1,60 @@
+# Installed path note: the /opt/ffn-ngfw-v2 paths below are correct and are NOT
+# this repository's layout. An appliance image is assembled by tarring a live
+# box's flat /opt/ffn-ngfw-v2 directory, so that is where these files land at
+# runtime regardless of where they sit in git. If you deploy a node straight
+# from a checkout instead, change the three paths below to your checkout.
+[Unit]
+Description=FFN Crucible analysis node (offloaded unknown-object detonation)
+Documentation=file:/opt/ffn-ngfw-v2/ffn_crucible_node.py
+Documentation=https://github.com/FreeFlow-Networks-Inc/ffn-crucible
+After=network-online.target ffn-sysd.service
+Wants=network-online.target
+# Inert unless enabled. This unit is for a DEDICATED analysis box, not for a
+# firewall: it detonates malware, and a sandbox escape on the device that
+# enforces your policy is the worst possible outcome. A firewall relays TO this
+# with cloud_det's relay backend; it does not run it.
+ConditionPathExists=/etc/ffn-ngfw/crucible-verdict.key
+
+[Service]
+Type=simple
+ExecStartPre=/bin/mkdir -p /var/lib/ffn-ngfw/crucible/samples
+# Refuse to start unsigned. A node whose verdicts carry no signature is one a
+# firewall will reject every answer from, and failing loudly here beats an
+# empty queue nobody can explain.
+ExecStartPre=/usr/bin/python3 -c "import sys; sys.exit(0 if open('/etc/ffn-ngfw/crucible-verdict.key').read().strip() else 1)"
+ExecStart=/usr/bin/python3 /opt/ffn-ngfw-v2/ffn_crucible_node.py serve \
+    --bind ${FFN_CRUCIBLE_BIND} --port ${FFN_CRUCIBLE_PORT} \
+    --policy ${FFN_CRUCIBLE_POLICY} --workers ${FFN_CRUCIBLE_WORKERS} \
+    --timeout ${FFN_CRUCIBLE_TIMEOUT}
+Restart=always
+RestartSec=10
+
+Environment=FFN_CRUCIBLE_BIND=0.0.0.0
+Environment=FFN_CRUCIBLE_PORT=8449
+# best = use the highest-fidelity chamber available. On a dedicated node this is
+# the point: it is where execution is supposed to happen.
+Environment=FFN_CRUCIBLE_POLICY=best
+Environment=FFN_CRUCIBLE_WORKERS=2
+Environment=FFN_CRUCIBLE_TIMEOUT=30
+Environment=FFN_CRUCIBLE_DB=/var/lib/ffn-ngfw/crucible/node.sqlite
+Environment=FFN_CRUCIBLE_SPOOL=/var/lib/ffn-ngfw/crucible
+Environment=FFN_CRUCIBLE_SEED=/etc/ffn-ngfw/crucible-verdict.key
+Environment=FFN_CRUCIBLE_PUB=/etc/ffn-ngfw/crucible-verdict.pub
+Environment=FFN_CRUCIBLE_TOKEN=/etc/ffn-ngfw/crucible-node.token
+
+# Hardening. Note what is deliberately NOT set: this service starts QEMU guests
+# and unshares namespaces, so PrivateDevices (needs /dev/kvm), NoNewPrivileges
+# (needs unprivileged userns) and a read-only /var would each break a chamber.
+# The containment that matters is the guest boundary, not the unit file.
+ProtectHome=yes
+ProtectSystem=full
+ReadWritePaths=/var/lib/ffn-ngfw/crucible
+PrivateTmp=no
+# Detonation is bursty and must never starve the rest of the box.
+CPUWeight=40
+IOWeight=40
+MemoryMax=75%
+TasksMax=4096
+
+[Install]
+WantedBy=multi-user.target
