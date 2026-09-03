@@ -217,9 +217,12 @@ python3 ffn_crucible.py assay --policy jail ./sample
 `ffn_ed25519.py` is byte-identical to FFN-NGFW's copy, and deliberately
 duplicated rather than imported: the node cannot sign a verdict without it, and
 a signing engine that depends on the firewall repo being checked out beside it
-would not stand alone. Drift is detectable rather than theoretical — it
-implements RFC 8032, whose test vectors are frozen, and
-`ffn_ed25519.py --selftest` checks them in both repos' CI.
+would not stand alone.
+
+Drift is checked, but not by the selftest in this repository — both copies
+would pass their own RFC 8032 vectors while diverging in any other respect.
+FFN-NGFW's CI compares the two files byte for byte, because it is the only
+place both exist at once (this repository is its `crucible/` submodule).
 
 `ffn_crucible.py` soft-imports `inline_payload_det` and `ffn_threatdb` from
 FFN-NGFW when they are present, and falls back to equivalent local definitions

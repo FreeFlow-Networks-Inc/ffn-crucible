@@ -74,8 +74,12 @@ jobs:
 
       # ed25519 is a dependency-free reference implementation because the
       # target appliances have no `cryptography` module. Its selftest covers
-      # the RFC 8032 s7.1 vectors plus negative cases, and it is the mechanism
-      # by which drift from FFN-NGFW's identical copy would be detected.
+      # the RFC 8032 s7.1 vectors plus negative cases.
+      #
+      # It does NOT detect drift from FFN-NGFW's copy of this file -- both
+      # copies would pass their own vectors while diverging in every other
+      # respect. The byte-identity check lives in FFN-NGFW's CI, which is the
+      # only place both files exist at once.
       - name: ffn_ed25519 selftest (RFC 8032 vectors)
         run: python3 ffn_ed25519.py --selftest
 

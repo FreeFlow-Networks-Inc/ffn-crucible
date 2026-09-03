@@ -13,7 +13,13 @@ Wants=network-online.target
 # firewall: it detonates malware, and a sandbox escape on the device that
 # enforces your policy is the worst possible outcome. A firewall relays TO this
 # with cloud_det's relay backend; it does not run it.
+# Both are required, and the token is not optional: without it, a node that
+# binds anything but loopback would accept submissions from anyone who can
+# reach the port -- so serve() refuses to start that way. Generate them with
+#   ffn_crucible_node.py keygen --prefix /etc/ffn-ngfw/crucible-verdict
+#   head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' > /etc/ffn-ngfw/crucible-node.token
 ConditionPathExists=/etc/ffn-ngfw/crucible-verdict.key
+ConditionPathExists=/etc/ffn-ngfw/crucible-node.token
 
 [Service]
 Type=simple
@@ -29,7 +35,14 @@ ExecStart=/usr/bin/python3 /opt/ffn-ngfw-v2/ffn_crucible_node.py serve \
 Restart=always
 RestartSec=10
 
-Environment=FFN_CRUCIBLE_BIND=0.0.0.0
+# Loopback by DEFAULT. Exposing a malware-submission endpoint is an explicit
+# decision, not something a unit file should do on your behalf. To let
+# firewalls reach this node, override with a drop-in naming the specific
+# management address it should listen on:
+#   systemctl edit ffn-crucible-node
+#   [Service]
+#   Environment=FFN_CRUCIBLE_BIND=10.x.y.z
+Environment=FFN_CRUCIBLE_BIND=127.0.0.1
 Environment=FFN_CRUCIBLE_PORT=8449
 # best = use the highest-fidelity chamber available. On a dedicated node this is
 # the point: it is where execution is supposed to happen.

@@ -1,0 +1,25 @@
+# gitleaks configuration.
+#
+# One file contains byte strings that look exactly like key material and is not:
+# ffn_ed25519.py carries the published RFC 8032 s7.1 known-answer test vectors.
+# (FFN-NGFW's copy of this config also covers ffn_fips_selftest.py, which is not
+# part of this repository -- an allowlist entry for an absent file is how a
+# stale exception ends up shadowing a real one later.)
+# A scanner that flags them is correct about the shape and wrong about the
+# meaning, and the first push will fail on them unless they are allowlisted.
+#
+# This file is deliberately narrow. It allowlists two known files for one known
+# reason -- it does not disable any rule globally, because the next real secret
+# should still be caught.
+title = "ffn-crucible"
+
+[extend]
+useDefault = true
+
+[[rules]]
+  id = "generic-api-key"
+  [rules.allowlist]
+    description = "Published standards test vectors, not secrets. RFC 8032 s7.1 Ed25519 seeds and NIST known-answer vectors."
+    paths = [
+      '''ffn_ed25519\.py''',
+    ]

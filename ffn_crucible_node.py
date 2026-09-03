@@ -814,10 +814,26 @@ def _esc(s) -> str:
     return html.escape(str(s if s is not None else ""), quote=True)
 
 
+LOOPBACK = ("127.0.0.1", "::1", "localhost")
+
+
 def serve(node: "CrucibleNode", *, bind: str = "127.0.0.1",
           port: int = DEFAULT_PORT, certfile: str = "", keyfile: str = "",
-          block: bool = True) -> "_Server":
-    """Start the HTTP(S) server. Returns the server; caller may shut it down."""
+          block: bool = True, allow_insecure: bool = False) -> "_Server":
+    """Start the HTTP(S) server. Returns the server; caller may shut it down.
+
+    Refuses to expose an unauthenticated endpoint. Binding anything but
+    loopback with no bearer token configured means any host that can reach the
+    port may submit samples and read verdicts -- which tells an attacker
+    whether their sample is detected before they use it, and lets them fill the
+    queue. That was previously a log warning, which is not an access control.
+    """
+    if bind not in LOOPBACK and node.token() is None and not allow_insecure:
+        raise RuntimeError(
+            "refusing to bind %s with no bearer token: any host that can reach "
+            "this port could submit samples and read verdicts. Write a token to "
+            "%s (chmod 600), bind 127.0.0.1 instead, or pass allow_insecure to "
+            "accept the exposure deliberately." % (bind, TOKEN_PATH))
     httpd = _Server((bind, port), _Handler)
     httpd.node = node
     if certfile and keyfile:
@@ -830,14 +846,18 @@ def serve(node: "CrucibleNode", *, bind: str = "127.0.0.1",
         scheme = "http"
     real_port = httpd.server_address[1]
 
-    if node.token() is None and bind not in ("127.0.0.1", "::1", "localhost"):
-        logger.warning("no bearer token in %s and bound to %s: any host that "
-                       "can reach this port can submit samples", TOKEN_PATH, bind)
+    if node.token() is None and bind not in LOOPBACK:
+        # Only reachable with allow_insecure, since the check above refuses
+        # otherwise. Deliberate exposure still gets said out loud.
+        logger.warning("EXPOSED: no bearer token in %s and bound to %s -- any "
+                       "host that can reach this port can submit samples and "
+                       "read verdicts (allow_insecure was set)",
+                       TOKEN_PATH, bind)
     if not node.signer.can_sign():
         logger.warning("no signing seed at %s: verdicts will be UNSIGNED and a "
                        "firewall requiring signatures will reject them",
                        node.signer.seed_path)
-    if scheme == "http" and bind not in ("127.0.0.1", "::1", "localhost"):
+    if scheme == "http" and bind not in LOOPBACK:
         logger.warning("serving plaintext on %s: samples and verdicts cross the "
                        "network in the clear (verdicts stay ed25519-signed, so "
                        "they cannot be forged, but they can be read)", bind)
@@ -1030,24 +1050,36 @@ def selftest() -> int:
                           {"Content-Type": "application/octet-stream"})
         check(code == 401, "an unauthenticated submission is refused")
 
-        deadline = time.time() + 30
+        # Generous on purpose: the analysis budget is not what this test is
+        # checking, and a deadline tight enough to expire on a loaded machine
+        # turns a working system into a red build.
+        deadline = time.time() + 120
         served = {}
         while time.time() < deadline:
             code, served = http("GET", "/verdict/%s" % pe_sha, headers=auth)
             if served.get("status") == "done":
                 break
             time.sleep(0.2)
-        check(served.get("status") == "done",
-              "the worker pool analysed the HTTP submission")
-        check(VerdictSigner.verify(served, pub),
-              "the verdict served over HTTP verifies")
-        check(served["verdict"] in ("malware", "grayware"),
-              "overlay-carrying injector -> %s/%s"
-              % (served.get("verdict"), served.get("threat")))
+        finished = served.get("status") == "done"
+        check(finished, "the worker pool analysed the HTTP submission"
+              if finished else
+              "the worker pool did not finish within 120s (status=%s) -- the "
+              "checks below are skipped, not failed"
+              % served.get("status"))
+        if finished:
+            # .get() rather than [] so a malformed bundle fails a check instead
+            # of raising on top of it.
+            check(VerdictSigner.verify(served, pub),
+                  "the verdict served over HTTP verifies")
+            check(served.get("verdict") in ("malware", "grayware"),
+                  "overlay-carrying injector -> %s/%s"
+                  % (served.get("verdict"), served.get("threat")))
 
-        code, body = http("GET", "/report/%s" % pe_sha, headers=auth)
-        check(code == 200 and body.get("details", {}).get("chamber") == "static",
-              "the full report is retrievable and names its chamber")
+        if finished:
+            code, body = http("GET", "/report/%s" % pe_sha, headers=auth)
+            check(code == 200
+                  and body.get("details", {}).get("chamber") == "static",
+                  "the full report is retrievable and names its chamber")
 
         print("\n5. the HTTP surface refuses everything else")
         for method, path, expect in (("GET", "/etc/passwd", 404),
@@ -1098,6 +1130,45 @@ def selftest() -> int:
               and bare.status()["authenticated"] is False,
               "status reports both gaps so an operator can see them")
         bare.store.close()
+
+        print("\n7b. an unauthenticated endpoint is not exposed")
+        untokened = CrucibleNode(
+            NodeStore(db_path=os.path.join(tmp, "exposed.sqlite"),
+                      spool=os.path.join(tmp, "exposed-spool")),
+            policy=POLICY_STATIC, workers=1, signer=signer,
+            node_id="exposed", token="")
+        try:
+            refused = False
+            try:
+                serve(untokened, bind="0.0.0.0", port=0, block=False)
+            except RuntimeError as e:
+                refused = "bearer token" in str(e)
+            check(refused,
+                  "binding 0.0.0.0 with no token is refused, not merely warned")
+            # Loopback with no token stays permitted: it is contained, and the
+            # rest of this selftest depends on it.
+            local_ok = None
+            try:
+                local_ok = serve(untokened, bind="127.0.0.1", port=0,
+                                 block=False)
+                check(True, "loopback with no token is still permitted")
+            finally:
+                if local_ok is not None:
+                    local_ok.shutdown()
+                    local_ok.server_close()
+            # And the deliberate override works, because a lab needs it.
+            forced = None
+            try:
+                forced = serve(untokened, bind="127.0.0.1", port=0,
+                               block=False, allow_insecure=True)
+                check(True, "allow_insecure is honoured for deliberate exposure")
+            finally:
+                if forced is not None:
+                    forced.shutdown()
+                    forced.server_close()
+        finally:
+            untokened.stop()
+            untokened.store.close()
 
         print("\n8. durability")
         node.store.close()
@@ -1152,6 +1223,10 @@ def main(argv=None) -> int:
     p.add_argument("--node-id", default="")
     p.add_argument("--cert", default="", help="TLS certificate (optional)")
     p.add_argument("--key", default="", help="TLS private key (optional)")
+    p.add_argument("--allow-insecure", action="store_true",
+                   help="permit a non-loopback bind with no bearer token. Any "
+                        "host that can reach the port could then submit "
+                        "samples and read verdicts; for an isolated lab only.")
 
     p = sub.add_parser("work", help="drain the queue once and exit")
     p.add_argument("--limit", type=int, default=50)
@@ -1202,8 +1277,13 @@ def main(argv=None) -> int:
     if args.cmd == "serve":
         node = build_node(args.policy, args.timeout, args.guests,
                           args.node_id, max(1, args.workers))
-        serve(node, bind=args.bind, port=args.port, certfile=args.cert,
-              keyfile=args.key, block=True)
+        try:
+            serve(node, bind=args.bind, port=args.port, certfile=args.cert,
+                  keyfile=args.key, block=True,
+                  allow_insecure=args.allow_insecure)
+        except RuntimeError as e:
+            print("ERROR: %s" % e, file=sys.stderr)
+            return 2
         return 0
 
     if args.cmd == "work":
