@@ -344,6 +344,76 @@ class BehaviorTrace:
         self.file_type = self.file_type or other.file_type
         return self
 
+    def executable_shaped(self) -> bool:
+        """Is this the kind of object whose silence should not clear it?"""
+        return (self.file_type in ("pe", "elf", "macho", "ole")
+                or self.has("capability", "macro")
+                or self.has("capability", "macro_auto"))
+
+    def chamber_failed(self) -> bool:
+        """Did the analysis itself go wrong, as opposed to the sample?"""
+        return bool(self.errors) or bool(self.of_kind("error"))
+
+    # Kinds that constitute BEHAVIOUR, as opposed to lifecycle bookkeeping.
+    # `process:exited` is not in here on purpose: every process exits.
+    BEHAVIOURAL = ("file", "net", "registry", "persist", "crypto", "capability")
+    BEHAVIOURAL_PROCESS = ("exec", "spawn", "kill", "inject")
+
+    def behavioural(self) -> bool:
+        """Did the sample actually DO anything we observed at run time?"""
+        for o in self.observations:
+            if not o.live:
+                continue
+            if o.kind in self.BEHAVIOURAL:
+                return True
+            if o.kind == "process" and o.what in self.BEHAVIOURAL_PROCESS:
+                return True
+        return False
+
+    def conclusive(self) -> bool:
+        """Could this run have SEEN misbehaviour if there were any?
+
+        The sample has to have been executed, the chamber has to have worked,
+        and the run has to have either observed real behaviour or reached a
+        normal conclusion. A trace with neither is indistinguishable from a
+        sample that refused to run -- or from one that crashed before it
+        started, which is how a segfaulting ELF was reported benign.
+        """
+        if not self.executed or self.chamber_failed():
+            return False
+        if self.behavioural():
+            return True                    # it showed us something; that counts
+        if self.has("process", "crashed"):
+            return False                   # died before it could show us
+        if self.has("evade", "hung") or self.has("evade", "guest_hung"):
+            return False                   # killed, so the run is incomplete
+        # Exited normally having done nothing observable. Weak, but real.
+        return self.has("process", "exited") or bool(
+            [o for o in self.observations if o.live])
+
+    def inconclusive_reason(self) -> str:
+        """Why this run cannot clear an executable. Goes in the report."""
+        if self.fidelity == 0:
+            return ("static inspection only: not enough to clear an "
+                    "executable object")
+        if self.chamber_failed():
+            return ("the %s chamber did not complete (%s), so its silence is "
+                    "not evidence" % (self.chamber,
+                                      (self.errors or ["see observations"])[0]))
+        if not self.executed:
+            return ("the %s chamber never executed the sample, so its silence "
+                    "is not evidence" % self.chamber)
+        if self.has("process", "crashed"):
+            return ("the sample died on a signal in the %s chamber before "
+                    "doing anything observable, so it never reached its own "
+                    "logic" % self.chamber)
+        if self.has("evade", "hung") or self.has("evade", "guest_hung"):
+            return ("the %s chamber had to kill the sample, so the run is "
+                    "incomplete and its silence proves nothing" % self.chamber)
+        return ("the %s chamber executed the sample but observed nothing at "
+                "run time, which is what an evasive sample looks like"
+                % self.chamber)
+
     def summary(self) -> str:
         by = {}
         for o in self.observations:
@@ -455,6 +525,16 @@ TOKEN_WEIGHT.update({
     "revshell":       75,
     "obfuscation":    30,
     "encoded_command": 75,
+    # Anti-analysis. Weighted so that a sample which does nothing BUT evade
+    # cannot be silence -- see the Evasive.* rules.
+    "evade_vm":       55,
+    "evade_dbg":      45,
+    "evade_sleep":    30,
+    "guest_hung":     40,
+    # A crash is not malice, but it IS a reason to distrust the run.
+    "crashed":         5,
+    "hung":           40,
+    "mount":          20,
     "lolbin_download": 70,
     "remote_exec":    75,
     "eicar":         100,
@@ -469,6 +549,9 @@ TOKEN_WEIGHT.update({
     "persist_preload": 55,
     "persist_profile": 30,
     "persist_desktop": 30,
+    "persist_startup": 45,
+    "persist_ifeo":   55,
+    "hosts_file":     45,
     "wipe_shadow":    80,
     "wipe_recovery":  70,
     "wipe_backup":    75,
@@ -1752,6 +1835,22 @@ PERSIST_PATHS: List[Tuple[str, str, str]] = [
     ("/.profile",          "persist_profile", "shell-profile persistence"),
     ("/authorized_keys",   "persist_ssh", "SSH key persistence"),
     ("/etc/ld.so.preload", "persist_preload", "ld.so.preload hijack"),
+    # Windows. PERSIST_PATHS was entirely POSIX, so a guest chamber writing to
+    # a Startup folder or a Run key produced NO observation at all -- measured.
+    # Matched case-folded as substrings, so the leading drive letter is omitted.
+    ("\\start menu\\programs\\startup", "persist_startup", "Startup-folder persistence"),
+    ("\\currentversion\\run", "persist_reg", "Run-key persistence"),
+    ("\\currentversion\\runonce", "persist_reg", "RunOnce-key persistence"),
+    ("\\currentversion\\policies\\explorer\\run", "persist_reg", "policy Run-key persistence"),
+    ("\\currentcontrolset\\services", "persist_svc", "service persistence"),
+    ("\\windows\\system32\\tasks", "persist_task", "scheduled-task persistence"),
+    ("\\windows\\tasks", "persist_task", "scheduled-task persistence"),
+    ("\\appdata\\roaming\\microsoft\\windows\\start menu", "persist_startup", "Startup-folder persistence"),
+    ("\\winlogon\\shell", "persist_reg", "Winlogon shell hijack"),
+    ("\\winlogon\\userinit", "persist_reg", "Winlogon userinit hijack"),
+    ("\\image file execution options", "persist_ifeo", "IFEO debugger hijack"),
+    ("\\system32\\drivers\\etc\\hosts", "hosts_file", "hosts-file modification"),
+    ("\\system32\\config\\sam", "account_change", "SAM database access"),
     ("/etc/passwd",        "account_change", "account database modified"),
     ("/etc/shadow",        "account_change", "credential database modified"),
     ("/etc/sudoers",       "priv_escalation", "sudoers modified"),
@@ -2001,8 +2100,20 @@ class JailChamber(Chamber):
         if rep.get("launch_error"):
             tr.add("error", "launch_failed", str(rep["launch_error"])[:200])
         if rep.get("exit_code") is not None:
-            tr.add("process", "exited", "exit code %s" % rep["exit_code"],
-                   live=True, value=str(rep["exit_code"]))
+            code = rep["exit_code"]
+            tr.add("process", "exited", "exit code %s" % code,
+                   live=True, value=str(code))
+            # subprocess reports a signal death as a NEGATIVE returncode. Such
+            # a sample never reached its own logic, so the run cannot clear it
+            # unless something else was observed first -- see conclusive().
+            try:
+                signalled = int(code) < 0
+            except (TypeError, ValueError):
+                signalled = False
+            if signalled:
+                tr.add("process", "crashed",
+                       "died on signal %d before finishing" % -int(code),
+                       live=True, value=str(code))
         if rep.get("timed_out"):
             # Running until killed is not a fault: long-running samples are
             # usually the interesting ones (beacon loops, encryption sweeps).
@@ -2645,6 +2756,11 @@ class BehaviorRule:
     absent: Tuple[str, ...] = ()                # none may be present
     live_only: bool = False                    # ignore unless live evidence
     why: str = ""                              # operator-facing explanation
+    # Rules sharing a cap_group are alternative views of ONE fact, so the group
+    # contributes its single highest weight instead of the sum. Without this,
+    # nested rules (one implying another) silently double-count and can carry a
+    # class past a threshold it was never meant to reach.
+    cap_group: str = ""
 
     def matches(self, present: set, strong: set,
                 live: set) -> Tuple[bool, bool]:
@@ -2682,11 +2798,22 @@ RULES: List[BehaviorRule] = [
     BehaviorRule("Downloader", 65, "malware",
                  requires=("capability:download", "capability:exec"),
                  why="retrieves a payload and executes it"),
+    # A single ransom-suffixed file used to convict at 95 with high confidence.
+    # _classify_path emits crypto:ransom_extension PER FILE, so one stray
+    # backup artefact named *.enc anywhere in a scanned tree was a conviction.
+    # The destructive commands and the ransom note are still damning on their
+    # own -- there is no innocent reason to delete shadow copies -- but the
+    # extension now needs corroboration, which derive_aggregates supplies.
     BehaviorRule("Ransomware", 95, "malware",
-                 any_of=("crypto:ransom_extension", "crypto:ransom_note",
-                         "crypto:wipe_shadow", "crypto:wipe_backup"),
-                 why="behaves like ransomware: mass rewrite, notes, or "
-                     "destruction of recovery data"),
+                 any_of=("crypto:ransom_note", "crypto:wipe_shadow",
+                         "crypto:wipe_backup", "crypto:ransom_spread"),
+                 why="behaves like ransomware: ransom notes, many rewritten "
+                     "files, or destruction of recovery data"),
+    BehaviorRule("Crypto.SuspiciousRewrite", 40, "grayware",
+                 requires=("crypto:ransom_extension",),
+                 absent=("crypto:ransom_spread",),
+                 why="wrote a file with a ransom-associated suffix, but only "
+                     "one -- suspicious, not conclusive"),
     BehaviorRule("Backdoor.ReverseShell", 85, "malware",
                  requires=("capability:revshell",),
                  why="opens an interactive shell to a remote host"),
@@ -2754,6 +2881,33 @@ RULES: List[BehaviorRule] = [
                  any_of=("meta:packer", "meta:no_imports",
                          "meta:unpacks_at_runtime"),
                  why="hides its real content until it runs"),
+    # Evasion must never be silence. These fire on the anti-analysis tokens
+    # alone -- with no co-factor required -- because a sample whose ONLY
+    # observed behaviour is checking whether it is being watched has told us
+    # something, and the previous rule set scored it zero.
+    BehaviorRule("Evasive.SandboxCheck", 45, "grayware",
+                 any_of=("evade:evade_vm", "evade:evade_dbg",
+                         "capability:evade_vm", "capability:evade_dbg"),
+                 why="probed for a virtual machine or a debugger",
+                 cap_group="evasion"),
+    BehaviorRule("Evasive.Refused", 50, "grayware",
+                 requires=("evade:evade_vm",),
+                 absent=("process:exec", "file:write", "net:dns_query",
+                         "net:connect", "net:http_request"),
+                 live_only=True,
+                 why="checked for a sandbox and then did nothing else, which "
+                     "is what a sample does when it decides it is being "
+                     "watched",
+                 cap_group="evasion"),
+    BehaviorRule("Evasive.Hung", 40, "grayware",
+                 any_of=("evade:guest_hung", "evade:hung"),
+                 why="had to be killed rather than finishing, so the run is "
+                     "incomplete and its silence proves nothing",
+                 cap_group="evasion"),
+    BehaviorRule("Persistence.Windows", 55, "grayware",
+                 any_of=("persist:persist_startup", "persist:persist_ifeo",
+                         "persist:hosts_file"),
+                 why="installs itself through a Windows autostart mechanism"),
     BehaviorRule("AntiAnalysis", 45, "grayware",
                  requires=("capability:evade_dbg",),
                  any_of=("meta:packer", "capability:proc_inject",
@@ -2953,16 +3107,30 @@ def assay(tr: BehaviorTrace) -> AssayResult:
     res = AssayResult()
 
     total = 0.0
+    capped: Dict[str, float] = {}          # cap_group -> highest weight seen
+    capped_tokens: set = set()             # tokens a capped rule already scored
     for rule in RULES:
         ok, backed = rule.matches(present, strong, live)
         if not ok:
             continue
         weight = rule.weight * (1.0 if backed else LIVE_DISCOUNT)
-        total += weight
+        if rule.cap_group:
+            # Several views of one fact: keep the strongest, add nothing more.
+            prev = capped.get(rule.cap_group, 0.0)
+            capped[rule.cap_group] = max(prev, weight)
+            # ...and withhold that fact from the loose tally below, which would
+            # otherwise score the same tokens a second time and undo the cap.
+            capped_tokens.update(rule.requires)
+            capped_tokens.update(rule.any_of)
+        else:
+            total += weight
         res.matched.append((rule.name, int(weight), backed, rule.why))
-        res.reasons.append("%s (%+d%s): %s" % (
+        res.reasons.append("%s (%+d%s%s): %s" % (
             rule.name, int(weight),
-            "" if backed else ", from imports only", rule.why))
+            "" if backed else ", from imports only",
+            ", capped with %s" % rule.cap_group if rule.cap_group else "",
+            rule.why))
+    total += sum(capped.values())
 
     # Unmatched capability weight still counts, but weakly and with a ceiling:
     # a binary importing many suspicious APIs without forming a known pattern
@@ -2971,6 +3139,8 @@ def assay(tr: BehaviorTrace) -> AssayResult:
     for obs in tr.observations:
         if obs.kind not in ("capability", "persist", "crypto", "evade"):
             continue
+        if ("%s:%s" % (obs.kind, obs.what)) in capped_tokens:
+            continue                       # already scored, under a cap
         w = TOKEN_WEIGHT.get(obs.what)
         if not w:
             continue
@@ -2990,15 +3160,21 @@ def assay(tr: BehaviorTrace) -> AssayResult:
         res.verdict = "malware"
     elif res.score >= SCORE_GRAYWARE:
         res.verdict = "grayware"
-    elif tr.fidelity == 0 and (tr.file_type in ("pe", "elf", "macho", "ole")
-                               or tr.has("capability", "macro")):
-        # Refuse to call an executable benign from static inspection alone.
-        # That claim is exactly the false negative that gets someone owned, and
-        # returning `unknown` keeps the sample queued for a live chamber
-        # instead of caching a clean verdict for a week.
+    elif tr.executable_shaped() and not tr.conclusive():
+        # Refuse to call an executable benign unless the run that looked at it
+        # could actually have seen misbehaviour.
+        #
+        # This used to be gated on `tr.fidelity == 0`, which inverted the
+        # evidence. A chamber with fidelity > 0 switched the guard OFF even
+        # when it observed nothing at all, and even when it had failed --
+        # QemuChamber and JailChamber build their trace with
+        # fidelity=self.fidelity BEFORE any error return. So an evasive sample
+        # that detected the sandbox and exited, and a chamber whose guest never
+        # booted, both came back `benign score=0`. A run that learned nothing
+        # is LESS informative about safety than static analysis, not more:
+        # the sample may simply have declined to run.
         res.verdict = "unknown"
-        res.reasons.append("static inspection only: not enough to clear an "
-                           "executable object")
+        res.reasons.append(tr.inconclusive_reason())
     else:
         res.verdict = "benign"
 
@@ -3203,7 +3379,21 @@ def _assay_signatures(tr: BehaviorTrace, res: AssayResult) -> None:
 # Thresholds for aggregate behaviour. A single file write means nothing; the
 # COUNT is the signal, which is why these facts cannot be emitted by the code
 # that records individual events.
+# Selftest fixtures. Defined here rather than inline because a Windows path
+# literal has to survive being written by a patch script, and this file has
+# already been corrupted once by backslash mangling.
+WIN_STARTUP_PATH = ("C:" + chr(92) + "Users" + chr(92) + "u" + chr(92)
+                    + "AppData" + chr(92) + "Roaming" + chr(92)
+                    + "Microsoft" + chr(92) + "Windows" + chr(92)
+                    + "Start Menu" + chr(92) + "Programs" + chr(92)
+                    + "Startup" + chr(92) + "x.exe")
+WIN_RUNKEY_PATH = ("HKCU" + chr(92) + "Software" + chr(92) + "Microsoft"
+                   + chr(92) + "Windows" + chr(92) + "CurrentVersion"
+                   + chr(92) + "Run" + chr(92) + "Updater")
+
 MASS_WRITE_FILES = 25
+# How many ransom-suffixed files make a pattern rather than an artefact.
+RANSOM_SPREAD_FILES = 3
 MASS_DELETE_FILES = 15
 BEACON_MIN_REQUESTS = 3
 
@@ -3217,6 +3407,13 @@ def derive_aggregates(tr: BehaviorTrace) -> None:
         tr.add("crypto", "mass_rewrite",
                "wrote %d distinct files in one run" % len(writes), live=True,
                value=str(len(writes)))
+    # Several ransom-suffixed files in one run is the pattern; one is an
+    # artefact. The Ransomware rule reads this, not the per-file token.
+    marked = set(tr.values("crypto", "ransom_extension"))
+    if len(marked) >= RANSOM_SPREAD_FILES:
+        tr.add("crypto", "ransom_spread",
+               "wrote %d files with ransom-associated suffixes" % len(marked),
+               live=True, value=str(len(marked)))
     deletes = set(tr.values("file", "delete"))
     if len(deletes) >= MASS_DELETE_FILES:
         tr.add("crypto", "mass_delete",
@@ -3527,6 +3724,7 @@ class CrucibleSandbox:
                 "chamber": trace.chamber,
                 "fidelity": trace.fidelity,
                 "executed": trace.executed,
+                "conclusive": trace.conclusive(),
                 "confidence": res.confidence,
                 "size": trace.size,
                 "duration": round(time.time() - t0, 3),
@@ -4086,6 +4284,116 @@ def selftest() -> int:
     # one that shipped broken: the class referenced SEED_PATH/PUB_PATH while
     # those lived in another module, so VerdictSigner() raised NameError while
     # every test passed explicit paths and stayed green.
+    # -- 8b. silence from a live chamber must not clear an executable ------
+    #
+    # A class of bug that had no test at all: the guard against clearing an
+    # executable was gated on `tr.fidelity == 0`, so ANY chamber with fidelity
+    # > 0 switched it off -- including one that observed nothing, and one that
+    # failed outright, because the chambers build their trace with
+    # fidelity=self.fidelity before any error return.
+    print("\n8b. an uninformative run cannot clear an executable")
+    quiet_pe = build_test_pe({"kernel32.dll": ["ExitProcess", "GetStdHandle"]})
+
+    def _live(fidelity, chamber, *, executed=True, obs=(), errors=()):
+        tr = BehaviorTrace(sha256="silence", chamber=chamber, fidelity=fidelity)
+        dissect(quiet_pe, tr)
+        tr.executed = executed
+        for kind, what in obs:
+            tr.add(kind, what, "synthetic", live=True)
+        tr.errors.extend(errors)
+        derive_aggregates(tr)
+        return tr, assay(tr)
+
+    _tr, r0 = _live(0, "static", executed=False)
+    check(r0.verdict == "unknown",
+          "static-only on a quiet PE is unknown (%s)" % r0.verdict)
+
+    tr1, r1 = _live(1, "jail")
+    check(r1.verdict == "unknown",
+          "a JAIL run that observed nothing is unknown, not benign (%s) -- "
+          "this was live on Linux" % r1.verdict)
+    check(not tr1.conclusive(), "and the trace reports itself inconclusive")
+    check("observed nothing at run time" in r1.reasons[-1],
+          "with a reason naming the evasive shape")
+
+    _tr, r2 = _live(2, "qemu")
+    check(r2.verdict == "unknown",
+          "a GUEST run that observed nothing is unknown, not benign (%s)"
+          % r2.verdict)
+
+    _tr, r3 = _live(2, "qemu", executed=False,
+                    errors=["guest agent never reported in"])
+    check(r3.verdict == "unknown",
+          "a FAILED chamber is unknown, not benign (%s)" % r3.verdict)
+    check("did not complete" in r3.reasons[-1],
+          "and blames the chamber, not the sample")
+
+    # The promise in docs/crucible-guest-image.md, which was false as coded.
+    _tr, r4 = _live(2, "qemu", obs=[("error", "no_agent")])
+    check(r4.verdict == "unknown",
+          "an error observation alone also blocks a clean verdict (%s)"
+          % r4.verdict)
+
+    # A conclusive run CAN clear it, or nothing would ever be benign.
+    tr5, r5 = _live(1, "jail", obs=[("process", "exec"), ("process", "exited")])
+    check(r5.verdict == "benign" and tr5.conclusive(),
+          "a run that DID observe behaviour can still clear it (%s)"
+          % r5.verdict)
+
+    print("\n8c. evasion is scored, and only as far as it should be")
+    ev = BehaviorTrace(sha256="evasive", chamber="qemu", fidelity=2)
+    dissect(quiet_pe, ev)
+    ev.executed = True
+    for what in ("evade_vm", "evade_dbg", "evade_sleep", "guest_hung"):
+        ev.add("evade", what, "probed for analysis", live=True)
+    derive_aggregates(ev)
+    rev = assay(ev)
+    check(rev.verdict != "benign",
+          "a sample that only probed for a sandbox is not benign (%s)"
+          % rev.verdict)
+    check(rev.verdict == "grayware",
+          "it is grayware, NOT malware: hiding from us is not proof of malice, "
+          "and a conviction would blocklist its hash off the back of it (%s/%d)"
+          % (rev.verdict, rev.score))
+    check(rev.score < SCORE_MALWARE,
+          "the evasion cap_group holds it under the conviction line (%d < %d)"
+          % (rev.score, SCORE_MALWARE))
+    check(any(n.startswith("Evasive.") for (n, _w, _b, _y) in rev.matched),
+          "and an Evasive.* rule is named in the report")
+
+    print("\n8d. Windows persistence and the ransomware threshold")
+    wp = BehaviorTrace(sha256="winpersist", chamber="qemu", fidelity=2)
+    wp.executed = True
+    _classify_path(WIN_STARTUP_PATH, wp)
+    check(wp.has("persist", "persist_startup"),
+          "a Startup-folder write is recognised (PERSIST_PATHS was all POSIX)")
+    _classify_path(WIN_RUNKEY_PATH, wp)
+    check(wp.has("persist", "persist_reg"), "a Run-key write is recognised")
+
+    one = BehaviorTrace(sha256="oneenc", chamber="qemu", fidelity=2)
+    one.executed = True
+    one.add("crypto", "ransom_extension", "one file", live=True,
+            value="/backup/old.enc")
+    derive_aggregates(one)
+    r_one = assay(one)
+    check(r_one.verdict != "malware",
+          "ONE ransom-suffixed file is not a conviction (%s/%d) -- that token "
+          "is emitted per file, so a stray backup artefact used to convict "
+          "at 95" % (r_one.verdict, r_one.score))
+
+    many = BehaviorTrace(sha256="manyenc", chamber="qemu", fidelity=2)
+    many.executed = True
+    for i in range(RANSOM_SPREAD_FILES + 1):
+        many.add("crypto", "ransom_extension", "encrypted", live=True,
+                 value="/home/u/doc%d.enc" % i)
+    derive_aggregates(many)
+    r_many = assay(many)
+    check(many.has("crypto", "ransom_spread"),
+          "%d of them is a spread" % (RANSOM_SPREAD_FILES + 1))
+    check(r_many.verdict == "malware" and r_many.threat_name == "Ransomware",
+          "and THAT convicts as ransomware (%s/%s)"
+          % (r_many.verdict, r_many.threat_name))
+
     print("\n9a. the signature type is always available")
     check(ContentSignature is not None,
           "ContentSignature resolves whether or not inline_payload_det is "
